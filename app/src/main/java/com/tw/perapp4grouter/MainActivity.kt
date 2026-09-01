@@ -17,6 +17,19 @@ import android.widget.TextView
 import android.widget.Toast
 import android.graphics.Color
 import androidx.appcompat.app.AppCompatActivity
+import org.json.JSONObject
+import java.net.HttpURLConnection
+import java.net.URL
+import java.io.BufferedReader
+import java.io.InputStreamReader
+import android.app.AlertDialog
+import android.app.DownloadManager
+import android.net.Uri
+import android.os.Environment
+import android.content.BroadcastReceiver
+import android.content.IntentFilter
+import androidx.core.content.FileProvider
+import java.io.File
 
 class MainActivity : AppCompatActivity() {
 
@@ -167,6 +180,7 @@ class MainActivity : AppCompatActivity() {
         
         loadInstalledApps()
         checkXiaomiMIUI()
+        checkForUpdates()
     }
 
     private fun checkXiaomiMIUI() {
@@ -295,5 +309,103 @@ class MainActivity : AppCompatActivity() {
         super.onPause()
         AppLogger.removeListener(logListener)
         tvConnectionStats.removeCallbacks(statsRunnable)
+    }
+
+    private fun checkForUpdates() {
+        Thread {
+            try {
+                val url = URL("https://api.github.com/repos/JohnLiang119/4G/releases/latest")
+                val connection = url.openConnection() as HttpURLConnection
+                connection.requestMethod = "GET"
+                connection.setRequestProperty("Accept", "application/vnd.github.v3+json")
+                
+                if (connection.responseCode == HttpURLConnection.HTTP_OK) {
+                    val reader = BufferedReader(InputStreamReader(connection.inputStream))
+                    val response = reader.readText()
+                    reader.close()
+                    
+                    val json = JSONObject(response)
+                    val tagName = json.getString("tag_name")
+                    val assets = json.getJSONArray("assets")
+                    if (assets.length() > 0) {
+                        val downloadUrl = assets.getJSONObject(0).getString("browser_download_url")
+                        
+                        val packageInfo = packageManager.getPackageInfo(packageName, 0)
+                        val currentVersion = "v" + packageInfo.versionName
+                        
+                        // Compare versions naively: if tagName != currentVersion, prompt update.
+                        if (tagName != currentVersion) {
+                            runOnUiThread {
+                                showUpdateDialog(tagName, downloadUrl)
+                            }
+                        }
+                    }
+                }
+            } catch (e: Exception) {
+                AppLogger.e("UpdateCheck", "Failed to check for updates", e)
+            }
+        }.start()
+    }
+
+    private fun showUpdateDialog(newVersion: String, downloadUrl: String) {
+        AlertDialog.Builder(this)
+            .setTitle("發現新版本")
+            .setMessage("最新版本為 $newVersion，是否要立即更新？")
+            .setPositiveButton("立即更新") { _, _ ->
+                downloadAndInstallApk(downloadUrl, newVersion)
+            }
+            .setNegativeButton("稍後再說", null)
+            .show()
+    }
+
+    private fun downloadAndInstallApk(apkUrl: String, version: String) {
+        Toast.makeText(this, "開始下載更新...", Toast.LENGTH_SHORT).show()
+        
+        // Ensure old file is deleted
+        val file = File(getExternalFilesDir(Environment.DIRECTORY_DOWNLOADS), "update.apk")
+        if (file.exists()) {
+            file.delete()
+        }
+
+        val request = DownloadManager.Request(Uri.parse(apkUrl))
+            .setTitle("4G Router 更新 ($version)")
+            .setDescription("正在下載最新版本...")
+            .setNotificationVisibility(DownloadManager.Request.VISIBILITY_VISIBLE_NOTIFY_COMPLETED)
+            .setDestinationInExternalFilesDir(this, Environment.DIRECTORY_DOWNLOADS, "update.apk")
+        
+        val downloadManager = getSystemService(Context.DOWNLOAD_SERVICE) as DownloadManager
+        val downloadId = downloadManager.enqueue(request)
+        
+        val receiver = object : BroadcastReceiver() {
+            override fun onReceive(context: Context, intent: Intent) {
+                val id = intent.getLongExtra(DownloadManager.EXTRA_DOWNLOAD_ID, -1)
+                if (id == downloadId) {
+                    installApk()
+                    unregisterReceiver(this)
+                }
+            }
+        }
+        
+        if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.TIRAMISU) {
+            registerReceiver(receiver, IntentFilter(DownloadManager.ACTION_DOWNLOAD_COMPLETE), Context.RECEIVER_EXPORTED)
+        } else {
+            registerReceiver(receiver, IntentFilter(DownloadManager.ACTION_DOWNLOAD_COMPLETE))
+        }
+    }
+
+    private fun installApk() {
+        try {
+            val file = File(getExternalFilesDir(Environment.DIRECTORY_DOWNLOADS), "update.apk")
+            val uri = FileProvider.getUriForFile(this, "$packageName.fileprovider", file)
+            val intent = Intent(Intent.ACTION_VIEW).apply {
+                setDataAndType(uri, "application/vnd.android.package-archive")
+                addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            }
+            startActivity(intent)
+        } catch (e: Exception) {
+            Toast.makeText(this, "安裝失敗，請手動開啟 APK", Toast.LENGTH_LONG).show()
+            AppLogger.e("UpdateCheck", "Failed to install APK", e)
+        }
     }
 }

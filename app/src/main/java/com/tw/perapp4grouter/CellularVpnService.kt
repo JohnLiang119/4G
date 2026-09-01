@@ -229,8 +229,8 @@ class CellularVpnService : VpnService() {
                     WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE,
                     PixelFormat.TRANSLUCENT
                 ).apply {
-                    gravity = Gravity.TOP or Gravity.START
-                    y = 80 // small offset from the very top
+                    gravity = Gravity.BOTTOM or Gravity.START
+                    y = 150 // small offset from the very bottom
                     x = 0
                 }
                 

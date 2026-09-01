@@ -23,13 +23,12 @@ import java.net.URL
 import java.io.BufferedReader
 import java.io.InputStreamReader
 import android.app.AlertDialog
-import android.app.DownloadManager
-import android.net.Uri
 import android.os.Environment
-import android.content.BroadcastReceiver
-import android.content.IntentFilter
 import androidx.core.content.FileProvider
 import java.io.File
+import android.widget.ProgressBar
+import java.io.FileOutputStream
+import java.io.InputStream
 
 class MainActivity : AppCompatActivity() {
 
@@ -359,38 +358,84 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun downloadAndInstallApk(apkUrl: String, version: String) {
-        Toast.makeText(this, "開始下載更新...", Toast.LENGTH_SHORT).show()
-        
-        // Ensure old file is deleted
-        val file = File(getExternalFilesDir(Environment.DIRECTORY_DOWNLOADS), "update.apk")
-        if (file.exists()) {
-            file.delete()
+        val progressBar = ProgressBar(this, null, android.R.attr.progressBarStyleHorizontal).apply {
+            max = 100
+            progress = 0
+            setPadding(32, 32, 32, 0)
+        }
+        val tvProgress = TextView(this).apply {
+            text = "0%"
+            setPadding(32, 16, 32, 32)
+        }
+        val layout = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            addView(progressBar)
+            addView(tvProgress)
         }
 
-        val request = DownloadManager.Request(Uri.parse(apkUrl))
-            .setTitle("4G Router 更新 ($version)")
-            .setDescription("正在下載最新版本...")
-            .setNotificationVisibility(DownloadManager.Request.VISIBILITY_VISIBLE_NOTIFY_COMPLETED)
-            .setDestinationInExternalFilesDir(this, Environment.DIRECTORY_DOWNLOADS, "update.apk")
-        
-        val downloadManager = getSystemService(Context.DOWNLOAD_SERVICE) as DownloadManager
-        val downloadId = downloadManager.enqueue(request)
-        
-        val receiver = object : BroadcastReceiver() {
-            override fun onReceive(context: Context, intent: Intent) {
-                val id = intent.getLongExtra(DownloadManager.EXTRA_DOWNLOAD_ID, -1)
-                if (id == downloadId) {
-                    installApk()
-                    unregisterReceiver(this)
+        val dialog = AlertDialog.Builder(this)
+            .setTitle("下載更新中 ($version)")
+            .setView(layout)
+            .setCancelable(false)
+            .show()
+
+        Thread {
+            var input: InputStream? = null
+            var output: FileOutputStream? = null
+            var connection: HttpURLConnection? = null
+            try {
+                val url = URL(apkUrl)
+                connection = url.openConnection() as HttpURLConnection
+                connection.connect()
+
+                if (connection.responseCode != HttpURLConnection.HTTP_OK) {
+                    throw Exception("Server returned HTTP ${connection.responseCode}")
                 }
+
+                val fileLength = connection.contentLength
+                val file = File(getExternalFilesDir(Environment.DIRECTORY_DOWNLOADS), "update.apk")
+                if (file.exists()) {
+                    file.delete()
+                }
+
+                input = connection.inputStream
+                output = FileOutputStream(file)
+
+                val data = ByteArray(4096)
+                var total: Long = 0
+                var count: Int
+                
+                while (input.read(data).also { count = it } != -1) {
+                    total += count.toLong()
+                    if (fileLength > 0) {
+                        val progress = (total * 100 / fileLength).toInt()
+                        runOnUiThread {
+                            progressBar.progress = progress
+                            tvProgress.text = "$progress%"
+                        }
+                    }
+                    output.write(data, 0, count)
+                }
+
+                runOnUiThread {
+                    dialog.dismiss()
+                    Toast.makeText(this@MainActivity, "下載完成！", Toast.LENGTH_SHORT).show()
+                    installApk()
+                }
+            } catch (e: Exception) {
+                AppLogger.e("UpdateCheck", "Failed to download APK", e)
+                runOnUiThread {
+                    dialog.dismiss()
+                    Toast.makeText(this@MainActivity, "下載失敗：${e.message}", Toast.LENGTH_LONG).show()
+                }
+            } finally {
+                try {
+                    output?.close()
+                    input?.close()
+                } catch (ignored: Exception) {}
+                connection?.disconnect()
             }
-        }
-        
-        if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.TIRAMISU) {
-            registerReceiver(receiver, IntentFilter(DownloadManager.ACTION_DOWNLOAD_COMPLETE), Context.RECEIVER_EXPORTED)
-        } else {
-            registerReceiver(receiver, IntentFilter(DownloadManager.ACTION_DOWNLOAD_COMPLETE))
-        }
+        }.start()
     }
 
     private fun installApk() {

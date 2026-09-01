@@ -29,6 +29,9 @@ import java.io.File
 import android.widget.ProgressBar
 import java.io.FileOutputStream
 import java.io.InputStream
+import com.google.android.material.bottomsheet.BottomSheetDialog
+import android.view.Gravity
+import android.view.ViewGroup
 
 class MainActivity : AppCompatActivity() {
 
@@ -61,11 +64,26 @@ class MainActivity : AppCompatActivity() {
             setPadding(32, 32, 32, 32)
         }
         
+        // Create a header row for title and settings button
+        val headerRow = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            setPadding(0, 0, 0, 32)
+        }
+        
         tvStatus = TextView(this).apply {
             text = "WiFi: 未知 | 4G: 未知"
             textSize = 18f
-            setPadding(0, 0, 0, 32)
+            layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
         }
+        
+        val btnSettings = Button(this).apply {
+            text = "⚙️ 設定"
+            setOnClickListener { showSettingsDialog() }
+        }
+        
+        headerRow.addView(tvStatus)
+        headerRow.addView(btnSettings)
         
         val vpnRow = LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
@@ -96,32 +114,6 @@ class MainActivity : AppCompatActivity() {
 
         prefs = getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
 
-        val switchNotification = Switch(this).apply {
-            text = "顯示下拉通知列統計"
-            textSize = 14f
-            isChecked = prefs.getBoolean(PREF_SHOW_NOTIF, true)
-            setOnCheckedChangeListener { _, isChecked ->
-                prefs.edit().putBoolean(PREF_SHOW_NOTIF, isChecked).apply()
-            }
-        }
-
-        switchFloatingWindow = Switch(this).apply {
-            text = "顯示懸浮視窗統計"
-            textSize = 14f
-            setPadding(0, 16, 0, 32)
-            isChecked = prefs.getBoolean(PREF_SHOW_FLOAT, false)
-            setOnCheckedChangeListener { _, isChecked ->
-                if (isChecked && !android.provider.Settings.canDrawOverlays(this@MainActivity)) {
-                    this.isChecked = false
-                    Toast.makeText(this@MainActivity, "請允許「顯示在其他應用程式上層」權限", Toast.LENGTH_LONG).show()
-                    val intent = Intent(android.provider.Settings.ACTION_MANAGE_OVERLAY_PERMISSION, android.net.Uri.parse("package:$packageName"))
-                    startActivityForResult(intent, REQUEST_OVERLAY)
-                } else {
-                    prefs.edit().putBoolean(PREF_SHOW_FLOAT, isChecked).apply()
-                }
-            }
-        }
-        
         val titleApps = TextView(this).apply {
             text = "請選擇要走 4G 的 APP："
             textSize = 16f
@@ -161,10 +153,8 @@ class MainActivity : AppCompatActivity() {
         }
         loggerScrollView.addView(tvLogger)
         
-        rootLayout.addView(tvStatus)
+        rootLayout.addView(headerRow)
         rootLayout.addView(vpnRow)
-        rootLayout.addView(switchNotification)
-        rootLayout.addView(switchFloatingWindow)
         rootLayout.addView(titleApps)
         rootLayout.addView(appsScrollView)
         rootLayout.addView(titleLog)
@@ -310,7 +300,112 @@ class MainActivity : AppCompatActivity() {
         tvConnectionStats.removeCallbacks(statsRunnable)
     }
 
-    private fun checkForUpdates() {
+    private fun showSettingsDialog() {
+        val dialog = BottomSheetDialog(this)
+        
+        val layout = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(48, 48, 48, 48)
+        }
+        
+        val titleSettings = TextView(this).apply {
+            text = "⚙️ 偏好設定"
+            textSize = 20f
+            gravity = Gravity.CENTER
+            setPadding(0, 0, 0, 48)
+        }
+        layout.addView(titleSettings)
+        
+        val titleVisual = TextView(this).apply {
+            text = "視窗與通知"
+            textSize = 14f
+            setTextColor(Color.GRAY)
+            setPadding(0, 0, 0, 16)
+        }
+        layout.addView(titleVisual)
+        
+        val switchNotification = Switch(this).apply {
+            text = "顯示下拉通知列統計"
+            textSize = 16f
+            setPadding(0, 16, 0, 16)
+            isChecked = prefs.getBoolean(PREF_SHOW_NOTIF, true)
+            setOnCheckedChangeListener { _, isChecked ->
+                prefs.edit().putBoolean(PREF_SHOW_NOTIF, isChecked).apply()
+            }
+        }
+        layout.addView(switchNotification)
+        
+        switchFloatingWindow = Switch(this).apply {
+            text = "顯示懸浮視窗統計"
+            textSize = 16f
+            setPadding(0, 16, 0, 32)
+            isChecked = prefs.getBoolean(PREF_SHOW_FLOAT, false)
+            setOnCheckedChangeListener { _, isChecked ->
+                if (isChecked && !android.provider.Settings.canDrawOverlays(this@MainActivity)) {
+                    this.isChecked = false
+                    Toast.makeText(this@MainActivity, "請允許「顯示在其他應用程式上層」權限", Toast.LENGTH_LONG).show()
+                    val intent = Intent(android.provider.Settings.ACTION_MANAGE_OVERLAY_PERMISSION, android.net.Uri.parse("package:$packageName"))
+                    startActivityForResult(intent, REQUEST_OVERLAY)
+                } else {
+                    prefs.edit().putBoolean(PREF_SHOW_FLOAT, isChecked).apply()
+                }
+            }
+        }
+        layout.addView(switchFloatingWindow)
+        
+        val titleVersion = TextView(this).apply {
+            text = "版本與更新"
+            textSize = 14f
+            setTextColor(Color.GRAY)
+            setPadding(0, 16, 0, 16)
+        }
+        layout.addView(titleVersion)
+        
+        val versionRow = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            setPadding(0, 16, 0, 32)
+            
+            val tvAppVerLabel = TextView(this@MainActivity).apply {
+                text = "App 版本"
+                textSize = 16f
+                layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
+            }
+            
+            val currentVersion = try {
+                packageManager.getPackageInfo(packageName, 0).versionName
+            } catch (e: Exception) {
+                "未知"
+            }
+            
+            val tvAppVerValue = TextView(this@MainActivity).apply {
+                text = "v$currentVersion >"
+                textSize = 16f
+                setTextColor(Color.GRAY)
+            }
+            
+            addView(tvAppVerLabel)
+            addView(tvAppVerValue)
+            
+            setOnClickListener {
+                Toast.makeText(this@MainActivity, "檢查更新中...", Toast.LENGTH_SHORT).show()
+                checkForUpdates(manual = true)
+            }
+        }
+        layout.addView(versionRow)
+        
+        val btnClose = Button(this).apply {
+            text = "關閉"
+            setBackgroundColor(Color.TRANSPARENT)
+            setTextColor(Color.parseColor("#2196F3"))
+            setOnClickListener { dialog.dismiss() }
+        }
+        layout.addView(btnClose)
+        
+        dialog.setContentView(layout)
+        dialog.show()
+    }
+
+    private fun checkForUpdates(manual: Boolean = false) {
         Thread {
             try {
                 val url = URL("https://api.github.com/repos/JohnLiang119/4G/releases/latest")
@@ -332,16 +427,28 @@ class MainActivity : AppCompatActivity() {
                         val packageInfo = packageManager.getPackageInfo(packageName, 0)
                         val currentVersion = "v" + packageInfo.versionName
                         
-                        // Compare versions naively: if tagName != currentVersion, prompt update.
                         if (tagName != currentVersion) {
                             runOnUiThread {
                                 showUpdateDialog(tagName, downloadUrl)
                             }
+                        } else if (manual) {
+                            runOnUiThread {
+                                Toast.makeText(this@MainActivity, "目前已是最新版本 ($currentVersion)", Toast.LENGTH_SHORT).show()
+                            }
                         }
+                    }
+                } else if (manual) {
+                    runOnUiThread {
+                        Toast.makeText(this@MainActivity, "檢查更新失敗，請稍後再試", Toast.LENGTH_SHORT).show()
                     }
                 }
             } catch (e: Exception) {
                 AppLogger.e("UpdateCheck", "Failed to check for updates", e)
+                if (manual) {
+                    runOnUiThread {
+                        Toast.makeText(this@MainActivity, "檢查更新失敗：${e.message}", Toast.LENGTH_SHORT).show()
+                    }
+                }
             }
         }.start()
     }

@@ -109,7 +109,13 @@ if ($LASTEXITCODE -ne 0) { Write-Error "Gradle Build Failed!"; exit 1 }
 
 Write-Host "複製 APK 檔案..." -ForegroundColor Cyan
 $apkDir = "app\build\outputs\apk\debug"
-$appVersion = "1.0.0"
+
+$buildGradle = Get-Content -Path "app\build.gradle.kts" -Raw -Encoding UTF8
+if ($buildGradle -match 'versionName\s*=\s*"([^"]+)"') {
+    $appVersion = $matches[1]
+} else {
+    $appVersion = "1.0.0"
+}
 
 if (Test-Path $apkDir) {
     # 複製前清理專案根目錄舊的 APK 產物

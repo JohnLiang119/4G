@@ -84,12 +84,27 @@ public class TCPOutput implements Runnable
                 int destinationPort = tcpHeader.destinationPort;
                 int sourcePort = tcpHeader.sourcePort;
 
+                com.tw.perapp4grouter.stats.FlowKey flowKey = null;
+                if (tcpHeader.isSYN()) {
+                    com.tw.perapp4grouter.stats.FlowObserver observer = com.tw.perapp4grouter.stats.FlowObservers.get();
+                    if (observer != null) {
+                        flowKey = observer.keyFor(
+                                com.tw.perapp4grouter.stats.FlowProtocol.TCP,
+                                currentPacket.ip4Header.sourceAddress.getHostAddress(),
+                                sourcePort,
+                                destinationAddress.getHostAddress(),
+                                destinationPort
+                        );
+                    }
+                }
+
                 String ipAndPort = destinationAddress.getHostAddress() + ":" +
                         destinationPort + ":" + sourcePort;
                 TCB tcb = TCB.getTCB(ipAndPort);
                 if (tcb == null)
                     initializeConnection(ipAndPort, destinationAddress, destinationPort,
-                            currentPacket, tcpHeader, responseBuffer);
+                            currentPacket, tcpHeader, responseBuffer, flowKey);
+
                 else if (tcpHeader.isSYN())
                     processDuplicateSYN(tcb, tcpHeader, responseBuffer);
                 else if (tcpHeader.isRST())
@@ -120,7 +135,8 @@ public class TCPOutput implements Runnable
     }
 
     private void initializeConnection(String ipAndPort, InetAddress destinationAddress, int destinationPort,
-                                      Packet currentPacket, TCPHeader tcpHeader, ByteBuffer responseBuffer)
+                                      Packet currentPacket, TCPHeader tcpHeader, ByteBuffer responseBuffer,
+                                      com.tw.perapp4grouter.stats.FlowKey flowKey)
             throws IOException
     {
         currentPacket.swapSourceAndDestination();
@@ -133,7 +149,14 @@ public class TCPOutput implements Runnable
 
             TCB tcb = new TCB(ipAndPort, random.nextInt(Short.MAX_VALUE + 1), tcpHeader.sequenceNumber, tcpHeader.sequenceNumber + 1,
                     tcpHeader.acknowledgementNumber, outputChannel, currentPacket);
+            tcb.flowKey = flowKey;
             TCB.putTCB(ipAndPort, tcb);
+            if (flowKey != null) {
+                com.tw.perapp4grouter.stats.FlowObserver observer = com.tw.perapp4grouter.stats.FlowObservers.get();
+                if (observer != null) {
+                    observer.onFlowOpened(flowKey);
+                }
+            }
 
             try
             {

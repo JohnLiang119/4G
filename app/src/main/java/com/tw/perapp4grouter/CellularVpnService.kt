@@ -11,6 +11,7 @@ import android.net.VpnService
 import android.os.Build
 import android.os.ParcelFileDescriptor
 import com.tw.perapp4grouter.localvpn.*
+import com.tw.perapp4grouter.stats.*
 import androidx.core.app.NotificationCompat
 import java.io.IOException
 import java.nio.ByteBuffer
@@ -27,6 +28,7 @@ import android.provider.Settings
 import android.content.SharedPreferences
 import android.view.MotionEvent
 import android.view.View
+import android.widget.LinearLayout
 
 class CellularVpnService : VpnService() {
 
@@ -50,11 +52,19 @@ class CellularVpnService : VpnService() {
     private var udpSelector: Selector? = null
     private var tcpSelector: Selector? = null
 
+    private var statsSession: VpnStatsSession? = null
+
     private var statsRunnable: Runnable? = null
     private val handler = android.os.Handler(android.os.Looper.getMainLooper())
 
     private var windowManager: WindowManager? = null
-    private var floatingView: TextView? = null
+    private var floatingLayout: LinearLayout? = null
+    private var tvFloatingSummary: TextView? = null
+    private var tvFloatingDetails: TextView? = null
+    private var isFloatingExpanded = false
+
+    private var lastNotificationTimeMillis = 0L
+    private var lastNotificationFlowCount = -1
 
     override fun onCreate() {
         super.onCreate()
@@ -79,8 +89,12 @@ class CellularVpnService : VpnService() {
     }
 
     private fun startVpn(allowedApps: List<String>) {
-        if (isRunning) return
-        
+        if (isRunning) {
+            // 執行中的 session 綁定的是當時已套用的清單；變更選擇必須重新套用（停止後再啟動）
+            AppLogger.i(TAG, "VPN 已在執行中，變更 APP 選擇需要重新啟動 VPN 才會生效")
+            return
+        }
+
         networkMonitor?.setListener(object : NetworkMonitor.NetworkStateListener {
             override fun onNetworkStateChanged(isWifiConnected: Boolean, isCellularConnected: Boolean) {
                 AppLogger.d(TAG, "Network state: WiFi=$isWifiConnected, Cellular=$isCellularConnected")
@@ -100,28 +114,80 @@ class CellularVpnService : VpnService() {
             .addRoute("0.0.0.0", 0)
             .addDnsServer("8.8.8.8")
 
-        for (appPackage in allowedApps) {
-            try {
-                builder.addAllowedApplication(appPackage)
-                AppLogger.d(TAG, "Added allowed app: $appPackage")
-            } catch (e: Exception) {
-                AppLogger.e(TAG, "App not found: $appPackage", e)
+        // 在 establish() 之前逐一驗證並加入允許清單，只保留真正被 builder 接受的 package
+        val appliedApps = AppliedAppSelector.apply(
+            selectedPackages = allowedApps,
+            resolver = AndroidAppliedPackageResolver(packageManager),
+            sink = object : AllowedApplicationSink {
+                override fun addAllowedApplication(packageName: String): Boolean = try {
+                    builder.addAllowedApplication(packageName)
+                    AppLogger.d(TAG, "Added allowed app: $packageName")
+                    true
+                } catch (e: Exception) {
+                    AppLogger.e(TAG, "App not found: $packageName", e)
+                    false
+                }
             }
+        )
+
+        if (appliedApps.isEmpty()) {
+            // 空的 allowed list 會讓 Android 把所有 APP 導入 VPN，因此必須在 establish() 之前中止
+            AppLogger.e(TAG, "沒有任何可套用的 APP，已中止建立 VPN（不會退化成全部 APP）", null)
+            showError("沒有任何可套用的 APP，請重新選擇後再啟動")
+            networkMonitor?.stop()
+            stopSelf()
+            return
         }
 
         try {
             vpnInterface = builder.establish()
+            if (vpnInterface == null) {
+                throw IOException("VpnService.establish() 回傳 null")
+            }
             AppLogger.d(TAG, "VPN Interface established: ${vpnInterface?.fd}")
             isRunning = true
 
+            // 只有在建立成功之後才開新的統計 generation，確保每個成功 session 都從零開始
+            startStatsSession(appliedApps)
             startLocalVpnEngine()
-            
+
         } catch (e: Exception) {
             AppLogger.e(TAG, "Failed to establish VPN", e)
             stopVpn()
         }
     }
-    
+
+    /** 以本次實際套用的 APP 清單建立新的統計 session。 */
+    private fun startStatsSession(appliedApps: List<AppliedApp>) {
+        val index = AppliedAppIndex.build(appliedApps)
+        val session = VpnStatsSession(
+            generation = VpnStatsSession.nextGeneration(),
+            appliedAppIndex = index,
+            ownerLookup = AndroidConnectionOwnerLookup(this)
+        )
+        statsSession = session
+        FlowObservers.set(session)
+        session.publishEmpty()
+        AppLogger.i(TAG, "統計 session 已建立（generation=${session.generation}，已套用 ${index.appliedPackages.size} 個 APP）")
+    }
+
+    /** 清除統計 session 的所有狀態，包含追蹤器、解析器與已發布的快照。 */
+    private fun stopStatsSession() {
+        FlowObservers.set(null)
+        statsSession?.shutdown()
+        statsSession = null
+        StatsSnapshotRepository.clear()
+    }
+
+    private fun showError(message: String) {
+        handler.post {
+            try {
+                android.widget.Toast.makeText(this, message, android.widget.Toast.LENGTH_LONG).show()
+            } catch (e: Exception) {
+            }
+        }
+    }
+
     private fun startLocalVpnEngine() {
         try {
             val fd = vpnInterface?.fileDescriptor ?: return
@@ -148,11 +214,17 @@ class CellularVpnService : VpnService() {
     }
 
     private fun stopVpn() {
-        if (!isRunning) return
+        if (!isRunning) {
+            // establish() 失敗等路徑仍必須清除已建立的統計狀態
+            stopStatsSession()
+            networkMonitor?.stop()
+            return
+        }
         AppLogger.d(TAG, "Stopping VPN Service...")
         
         isRunning = false
         stopStatsUpdater()
+        stopStatsSession()
         removeFloatingWindow()
         executorService?.shutdownNow()
         networkMonitor?.stop()
@@ -178,19 +250,46 @@ class CellularVpnService : VpnService() {
             override fun run() {
                 if (!isRunning) return
                 try {
-                    val tcpCount = com.tw.perapp4grouter.localvpn.TCB.getActiveTCBCount()
-                    val udpCount = com.tw.perapp4grouter.localvpn.UDPOutput.getActiveUDPCount()
-                    val notifText = "TCP 連線: $tcpCount | UDP 連線: $udpCount"
-                    val floatText = "$tcpCount/$udpCount"
+                    // 每秒由追蹤器推導一份新的不可變快照供三個介面共用
+                    statsSession?.publish()
+                    val snapshot = com.tw.perapp4grouter.stats.StatsSnapshotRepository.latest()
                     
-                    val manager = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
-                    if (prefs.getBoolean(MainActivity.PREF_SHOW_NOTIF, true)) {
-                        manager.notify(NOTIFICATION_ID, createNotification(notifText))
-                    } else {
-                        manager.notify(NOTIFICATION_ID, createNotification("VPN 路由服務執行中"))
+                    val now = System.currentTimeMillis()
+                    val flowsChangedToZeroOrFirst = (lastNotificationFlowCount == 0 && snapshot.totalFlows > 0) || 
+                                                    (lastNotificationFlowCount > 0 && snapshot.totalFlows == 0)
+                    
+                    if (now - lastNotificationTimeMillis >= 5000 || flowsChangedToZeroOrFirst) {
+                        lastNotificationTimeMillis = now
+                        lastNotificationFlowCount = snapshot.totalFlows
+
+                        val notifText: String
+                        if (snapshot.isEmpty) {
+                            notifText = "無作用中連線"
+                        } else {
+                            val sorted = snapshot.rows.sortedByDescending { it.total }
+                            val appCount = snapshot.activeAppCount
+                            val appWord = if (appCount == 1) "APP" else "APPs"
+                            val prefix = "$appCount $appWord · ${snapshot.totalFlows} 連線"
+                            
+                            val details = mutableListOf<String>()
+                            for (i in 0 until Math.min(2, sorted.size)) {
+                                details.add("${sorted[i].label}: ${sorted[i].total}")
+                            }
+                            if (sorted.size > 2) {
+                                details.add("另 ${sorted.size - 2} 個")
+                            }
+                            notifText = "$prefix (${details.joinToString(", ")})"
+                        }
+
+                        val manager = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+                        if (prefs.getBoolean(MainActivity.PREF_SHOW_NOTIF, true)) {
+                            manager.notify(NOTIFICATION_ID, createNotification(notifText))
+                        } else {
+                            manager.notify(NOTIFICATION_ID, createNotification("VPN 路由服務執行中"))
+                        }
                     }
 
-                    updateFloatingWindow(floatText, prefs)
+                    updateFloatingWindow(snapshot, prefs)
                 } catch (e: Exception) {}
                 
                 handler.postDelayed(this, 1000)
@@ -203,17 +302,32 @@ class CellularVpnService : VpnService() {
         statsRunnable?.let { handler.removeCallbacks(it) }
     }
 
-    private fun updateFloatingWindow(text: String, prefs: SharedPreferences) {
+    private fun updateFloatingWindow(snapshot: com.tw.perapp4grouter.stats.StatsSnapshot, prefs: SharedPreferences) {
         val showFloat = prefs.getBoolean(MainActivity.PREF_SHOW_FLOAT, false)
         if (showFloat && Settings.canDrawOverlays(this)) {
-            if (floatingView == null) {
+            if (floatingLayout == null) {
                 windowManager = getSystemService(Context.WINDOW_SERVICE) as WindowManager
-                floatingView = TextView(this).apply {
-                    textSize = 12f
-                    setTextColor(Color.WHITE)
-                    setBackgroundColor(Color.parseColor("#80000000"))
+                
+                floatingLayout = LinearLayout(this).apply {
+                    orientation = LinearLayout.VERTICAL
+                    setBackgroundColor(Color.parseColor("#99000000"))
                     setPadding(32, 16, 32, 16)
                 }
+                
+                tvFloatingSummary = TextView(this).apply {
+                    textSize = 12f
+                    setTextColor(Color.WHITE)
+                }
+                
+                tvFloatingDetails = TextView(this).apply {
+                    textSize = 10f
+                    setTextColor(Color.LTGRAY)
+                    setPadding(0, 8, 0, 0)
+                    visibility = View.GONE
+                }
+                
+                floatingLayout?.addView(tvFloatingSummary)
+                floatingLayout?.addView(tvFloatingDetails)
                 
                 val type = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
                     WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY
@@ -234,7 +348,7 @@ class CellularVpnService : VpnService() {
                     x = 0
                 }
                 
-                floatingView?.setOnTouchListener(object : View.OnTouchListener {
+                floatingLayout?.setOnTouchListener(object : View.OnTouchListener {
                     private var initialX = 0
                     private var initialY = 0
                     private var initialTouchX = 0f
@@ -250,11 +364,24 @@ class CellularVpnService : VpnService() {
                                 return true
                             }
                             MotionEvent.ACTION_MOVE -> {
-                                params.x = initialX + (event.rawX - initialTouchX).toInt()
-                                params.y = initialY + (event.rawY - initialTouchY).toInt()
-                                try {
-                                    windowManager?.updateViewLayout(floatingView, params)
-                                } catch (e: Exception) {}
+                                val dx = Math.abs(event.rawX - initialTouchX)
+                                val dy = Math.abs(event.rawY - initialTouchY)
+                                if (dx > 10 || dy > 10) {
+                                    params.x = initialX + (event.rawX - initialTouchX).toInt()
+                                    params.y = initialY + (event.rawY - initialTouchY).toInt()
+                                    try {
+                                        windowManager?.updateViewLayout(floatingLayout, params)
+                                    } catch (e: Exception) {}
+                                }
+                                return true
+                            }
+                            MotionEvent.ACTION_UP -> {
+                                val dx = Math.abs(event.rawX - initialTouchX)
+                                val dy = Math.abs(event.rawY - initialTouchY)
+                                if (dx < 10 && dy < 10) {
+                                    isFloatingExpanded = !isFloatingExpanded
+                                    updateFloatingWindowData(com.tw.perapp4grouter.stats.StatsSnapshotRepository.latest())
+                                }
                                 return true
                             }
                         }
@@ -263,21 +390,52 @@ class CellularVpnService : VpnService() {
                 })
 
                 try {
-                    windowManager?.addView(floatingView, params)
+                    windowManager?.addView(floatingLayout, params)
                 } catch (e: Exception) {}
             }
-            floatingView?.text = text
+            updateFloatingWindowData(snapshot)
         } else {
             removeFloatingWindow()
         }
     }
 
+    private fun updateFloatingWindowData(snapshot: com.tw.perapp4grouter.stats.StatsSnapshot) {
+        if (floatingLayout == null) return
+        
+        val keyguardManager = getSystemService(Context.KEYGUARD_SERVICE) as android.app.KeyguardManager
+        val isLocked = keyguardManager.isKeyguardLocked
+        
+        if (isLocked) {
+            isFloatingExpanded = false
+            tvFloatingSummary?.text = "${snapshot.activeAppCount} APP · ${snapshot.totalFlows} 連線"
+            tvFloatingDetails?.visibility = View.GONE
+            return
+        }
+
+        tvFloatingSummary?.text = "${snapshot.activeAppCount} APP · ${snapshot.totalFlows} 連線"
+        
+        if (isFloatingExpanded && !snapshot.isEmpty) {
+            val sorted = snapshot.rows.sortedByDescending { it.total }
+            val details = mutableListOf<String>()
+            for (i in 0 until Math.min(3, sorted.size)) {
+                details.add("${sorted[i].label}: ${sorted[i].total}")
+            }
+            tvFloatingDetails?.text = details.joinToString("\n")
+            tvFloatingDetails?.visibility = View.VISIBLE
+        } else {
+            tvFloatingDetails?.visibility = View.GONE
+        }
+    }
+
     private fun removeFloatingWindow() {
-        if (floatingView != null) {
+        if (floatingLayout != null) {
             try {
-                windowManager?.removeView(floatingView)
+                windowManager?.removeView(floatingLayout)
             } catch (e: Exception) {}
-            floatingView = null
+            floatingLayout = null
+            tvFloatingSummary = null
+            tvFloatingDetails = null
+            isFloatingExpanded = false
         }
     }
 
@@ -299,12 +457,20 @@ class CellularVpnService : VpnService() {
             this, 0, intent, PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
         )
 
+        val publicVersion = NotificationCompat.Builder(this, CHANNEL_ID)
+            .setContentTitle("4G Router")
+            .setContentText("VPN 路由服務執行中")
+            .setSmallIcon(android.R.drawable.ic_secure)
+            .build()
+
         return NotificationCompat.Builder(this, CHANNEL_ID)
             .setContentTitle("4G Router")
             .setContentText(contentText)
             .setSmallIcon(android.R.drawable.ic_secure) // Replace with app icon later
             .setContentIntent(pendingIntent)
             .setOnlyAlertOnce(true)
+            .setVisibility(NotificationCompat.VISIBILITY_PRIVATE)
+            .setPublicVersion(publicVersion)
             .build()
     }
 }

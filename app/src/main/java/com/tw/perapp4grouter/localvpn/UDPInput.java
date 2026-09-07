@@ -70,12 +70,19 @@ public class UDPInput implements Runnable
                         // Leave space for the header
                         receiveBuffer.position(HEADER_SIZE);
 
-                        DatagramChannel inputChannel = (DatagramChannel) key.channel();
+                        UdpAssociation association = (UdpAssociation) key.attachment();
+                        DatagramChannel inputChannel = association.channel;
                         // XXX: We should handle any IOExceptions here immediately,
                         // but that probably won't happen with UDP
                         int readBytes = inputChannel.read(receiveBuffer);
 
-                        Packet referencePacket = (Packet) key.attachment();
+                        association.lastActivityAt = com.tw.perapp4grouter.stats.SystemMonotonicClock.INSTANCE.elapsedMillis();
+                        com.tw.perapp4grouter.stats.FlowObserver observer = com.tw.perapp4grouter.stats.FlowObservers.get();
+                        if (observer != null && association.flowKey != null) {
+                            observer.onFlowActivity(association.flowKey);
+                        }
+
+                        Packet referencePacket = association.referencePacket;
                         referencePacket.updateUDPBuffer(receiveBuffer, readBytes);
                         receiveBuffer.position(HEADER_SIZE + readBytes);
 

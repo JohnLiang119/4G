@@ -39,18 +39,20 @@ public class UDPOutput implements Runnable
     private Selector selector;
 
     private static final int MAX_CACHE_SIZE = 5000; // Increased to prevent active connections from being dropped
-    private static LRUCache<String, DatagramChannel> channelCache =
-            new LRUCache<>(MAX_CACHE_SIZE, new LRUCache.CleanupCallback<String, DatagramChannel>()
+    private static LRUCache<String, UdpAssociation> channelCache =
+            new LRUCache<>(MAX_CACHE_SIZE, new LRUCache.CleanupCallback<String, UdpAssociation>()
             {
                 @Override
-                public void cleanup(Map.Entry<String, DatagramChannel> eldest)
+                public void cleanup(Map.Entry<String, UdpAssociation> eldest)
                 {
-                    closeChannel(eldest.getValue());
+                    closeAssociation(eldest.getValue());
                 }
             });
 
     public static int getActiveUDPCount() {
-        return channelCache.size();
+        synchronized (channelCache) {
+            return channelCache.size();
+        }
     }
 
     public static int getMaxUDPCount() {
@@ -62,6 +64,22 @@ public class UDPOutput implements Runnable
         this.inputQueue = inputQueue;
         this.selector = selector;
         this.vpnService = vpnService;
+    }
+
+    private static final long UDP_EXPIRY_MS = 60000;
+    private long lastSweepTime = 0;
+
+    private void sweepExpiredAssociations(long now) {
+        synchronized (channelCache) {
+            Iterator<Map.Entry<String, UdpAssociation>> it = channelCache.entrySet().iterator();
+            while (it.hasNext()) {
+                UdpAssociation association = it.next().getValue();
+                if (now - association.lastActivityAt >= UDP_EXPIRY_MS) {
+                    closeAssociation(association);
+                    it.remove();
+                }
+            }
+        }
     }
 
     @Override
@@ -78,6 +96,12 @@ public class UDPOutput implements Runnable
                 // TODO: Block when not connected
                 do
                 {
+                    long now = com.tw.perapp4grouter.stats.SystemMonotonicClock.INSTANCE.elapsedMillis();
+                    if (now - lastSweepTime > 1000) {
+                        lastSweepTime = now;
+                        sweepExpiredAssociations(now);
+                    }
+
                     currentPacket = inputQueue.poll();
                     if (currentPacket != null)
                         break;
@@ -90,10 +114,15 @@ public class UDPOutput implements Runnable
                 InetAddress destinationAddress = currentPacket.ip4Header.destinationAddress;
                 int destinationPort = currentPacket.udpHeader.destinationPort;
                 int sourcePort = currentPacket.udpHeader.sourcePort;
+                InetAddress sourceAddress = currentPacket.ip4Header.sourceAddress;
 
                 String ipAndPort = destinationAddress.getHostAddress() + ":" + destinationPort + ":" + sourcePort;
-                DatagramChannel outputChannel = channelCache.get(ipAndPort);
-                if (outputChannel == null) {
+                UdpAssociation association;
+                synchronized (channelCache) {
+                    association = channelCache.get(ipAndPort);
+                }
+                DatagramChannel outputChannel;
+                if (association == null) {
                     outputChannel = DatagramChannel.open();
                     vpnService.protect(outputChannel.socket());
                     LocalVpnNetworkHelper.bindDatagramSocketToNetwork(outputChannel.socket());
@@ -104,17 +133,42 @@ public class UDPOutput implements Runnable
                     catch (IOException e)
                     {
                         Log.e(TAG, "Connection error: " + ipAndPort, e);
-                        closeChannel(outputChannel);
+                        try { outputChannel.close(); } catch (Exception ex) {}
                         ByteBufferPool.release(currentPacket.backingBuffer);
                         continue;
                     }
                     outputChannel.configureBlocking(false);
+
+                    com.tw.perapp4grouter.stats.FlowKey flowKey = null;
+                    com.tw.perapp4grouter.stats.FlowObserver observer = com.tw.perapp4grouter.stats.FlowObservers.get();
+                    if (observer != null) {
+                        flowKey = observer.keyFor(
+                                com.tw.perapp4grouter.stats.FlowProtocol.UDP,
+                                sourceAddress.getHostAddress(),
+                                sourcePort,
+                                destinationAddress.getHostAddress(),
+                                destinationPort
+                        );
+                        observer.onFlowOpened(flowKey);
+                    }
+
+                    association = new UdpAssociation(outputChannel, currentPacket, flowKey, com.tw.perapp4grouter.stats.SystemMonotonicClock.INSTANCE.elapsedMillis());
+
                     currentPacket.swapSourceAndDestination();
 
                     selector.wakeup();
-                    outputChannel.register(selector, SelectionKey.OP_READ, currentPacket);
+                    outputChannel.register(selector, SelectionKey.OP_READ, association);
 
-                    channelCache.put(ipAndPort, outputChannel);
+                    synchronized (channelCache) {
+                        channelCache.put(ipAndPort, association);
+                    }
+                } else {
+                    outputChannel = association.channel;
+                    association.lastActivityAt = com.tw.perapp4grouter.stats.SystemMonotonicClock.INSTANCE.elapsedMillis();
+                    com.tw.perapp4grouter.stats.FlowObserver observer = com.tw.perapp4grouter.stats.FlowObservers.get();
+                    if (observer != null && association.flowKey != null) {
+                        observer.onFlowActivity(association.flowKey);
+                    }
                 }
 
                 try
@@ -126,8 +180,10 @@ public class UDPOutput implements Runnable
                 catch (IOException e)
                 {
                     Log.e(TAG, "Network write error: " + ipAndPort, e);
-                    channelCache.remove(ipAndPort);
-                    closeChannel(outputChannel);
+                    synchronized (channelCache) {
+                        channelCache.remove(ipAndPort);
+                    }
+                    closeAssociation(association);
                 }
                 ByteBufferPool.release(currentPacket.backingBuffer);
             }
@@ -148,23 +204,21 @@ public class UDPOutput implements Runnable
 
     private void closeAll()
     {
-        Iterator<Map.Entry<String, DatagramChannel>> it = channelCache.entrySet().iterator();
-        while (it.hasNext())
-        {
-            closeChannel(it.next().getValue());
-            it.remove();
+        synchronized (channelCache) {
+            Iterator<Map.Entry<String, UdpAssociation>> it = channelCache.entrySet().iterator();
+            while (it.hasNext())
+            {
+                closeAssociation(it.next().getValue());
+                it.remove();
+            }
         }
     }
 
-    private static void closeChannel(DatagramChannel channel)
+    static void closeAssociation(UdpAssociation association)
     {
-        try
-        {
-            channel.close();
-        }
-        catch (IOException e)
-        {
-            // Ignore
+        if (association != null) {
+            association.closeChannel();
+            association.notifyFlowClosed();
         }
     }
 }

@@ -16,6 +16,10 @@
 
 package com.tw.perapp4grouter.localvpn;
 
+import com.tw.perapp4grouter.stats.FlowKey;
+import com.tw.perapp4grouter.stats.FlowObserver;
+import com.tw.perapp4grouter.stats.FlowObservers;
+
 import java.io.IOException;
 import java.nio.channels.SelectionKey;
 import java.nio.channels.SocketChannel;
@@ -49,6 +53,12 @@ public class TCB
     public boolean waitingForNetworkData;
     public SelectionKey selectionKey;
 
+    /** 本 flow 於統計中的身分；在首次外送 SYN 時以原始五元組建立。 */
+    public FlowKey flowKey;
+
+    /** 確保所有終止路徑只會扣除統計一次。 */
+    private boolean statsClosed;
+
     private static final int MAX_CACHE_SIZE = 5000; // Increased to prevent active connections from being dropped
     private static LRUCache<String, TCB> tcbCache =
             new LRUCache<>(MAX_CACHE_SIZE, new LRUCache.CleanupCallback<String, TCB>()
@@ -56,7 +66,9 @@ public class TCB
                 @Override
                 public void cleanup(Map.Entry<String, TCB> eldest)
                 {
+                    // 快取淘汰同樣是終止路徑，必須把統計紀錄一併移除
                     eldest.getValue().closeChannel();
+                    eldest.getValue().notifyFlowClosed();
                 }
             });
 
@@ -100,6 +112,10 @@ public class TCB
         this.referencePacket = referencePacket;
     }
 
+    /**
+     * 所有 TCP 終止路徑（連線失敗、RST、雙向 FIN 完成、channel 錯誤、快取淘汰、
+     * 引擎關閉）共用的唯一清理入口，且為冪等操作。
+     */
     public static void closeTCB(TCB tcb)
     {
         tcb.closeChannel();
@@ -107,18 +123,52 @@ public class TCB
         {
             tcbCache.remove(tcb.ipAndPort);
         }
+        tcb.notifyFlowClosed();
     }
 
     public static void closeAll()
     {
+        java.util.List<TCB> closing = new java.util.ArrayList<>();
         synchronized (tcbCache)
         {
             Iterator<Map.Entry<String, TCB>> it = tcbCache.entrySet().iterator();
             while (it.hasNext())
             {
-                it.next().getValue().closeChannel();
+                TCB tcb = it.next().getValue();
+                tcb.closeChannel();
+                closing.add(tcb);
                 it.remove();
             }
+        }
+        // 在鎖外通知，避免統計回呼與封包執行緒互相等待
+        for (TCB tcb : closing)
+        {
+            tcb.notifyFlowClosed();
+        }
+    }
+
+    /**
+     * 把本 flow 從作用中統計移除。重複呼叫不會重複扣除。
+     */
+    void notifyFlowClosed()
+    {
+        FlowKey key;
+        synchronized (this)
+        {
+            if (statsClosed)
+                return;
+            statsClosed = true;
+            key = flowKey;
+        }
+
+        if (key == null)
+            return;
+
+        FlowObserver observer = FlowObservers.get();
+        if (observer != null)
+        {
+            // observer 內部會以 vpnGeneration 把關，舊 session 的事件不會影響新 session
+            observer.onFlowClosed(key);
         }
     }
 

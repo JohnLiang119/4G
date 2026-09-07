@@ -42,6 +42,7 @@ class MainActivity : AppCompatActivity() {
     private lateinit var tvLogger: TextView
     private lateinit var loggerScrollView: ScrollView
     private lateinit var tvConnectionStats: TextView
+    private lateinit var activeConnectionsContainer: LinearLayout
     private lateinit var switchFloatingWindow: Switch
     
     private val allowedApps = mutableSetOf<String>()
@@ -101,23 +102,47 @@ class MainActivity : AppCompatActivity() {
                 }
             }
         }
+        vpnRow.addView(switchVpn)
 
+        val activeConnectionsSection = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(0, 0, 0, 32)
+        }
+        val titleActiveConn = TextView(this).apply {
+            text = "作用中連線"
+            textSize = 16f
+            setPadding(0, 0, 0, 8)
+        }
+        
         tvConnectionStats = TextView(this).apply {
-            text = "TCP: 0/0 (0%) | UDP: 0/0 (0%)"
+            text = "無作用中連線"
             textSize = 12f
             setTextColor(Color.parseColor("#BB86FC"))
-            setPadding(32, 8, 0, 0)
+            setPadding(0, 0, 0, 16)
+        }
+        
+        activeConnectionsContainer = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
         }
 
-        vpnRow.addView(switchVpn)
-        vpnRow.addView(tvConnectionStats)
+        activeConnectionsSection.addView(titleActiveConn)
+        activeConnectionsSection.addView(tvConnectionStats)
+        activeConnectionsSection.addView(activeConnectionsContainer)
 
         prefs = getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
 
         val titleApps = TextView(this).apply {
             text = "請選擇要走 4G 的 APP："
             textSize = 16f
-            setPadding(0, 32, 0, 16)
+            setPadding(0, 32, 0, 8)
+        }
+
+        // 執行中的 VPN 綁定的是啟動當下已套用的清單，勾選變更僅為草稿
+        val hintApps = TextView(this).apply {
+            text = "變更勾選後需重新啟動 VPN 才會套用，統計也會重新歸零。"
+            textSize = 12f
+            setTextColor(Color.GRAY)
+            setPadding(0, 0, 0, 16)
         }
         
         val appsScrollView = ScrollView(this).apply {
@@ -155,7 +180,9 @@ class MainActivity : AppCompatActivity() {
         
         rootLayout.addView(headerRow)
         rootLayout.addView(vpnRow)
+        rootLayout.addView(activeConnectionsSection)
         rootLayout.addView(titleApps)
+        rootLayout.addView(hintApps)
         rootLayout.addView(appsScrollView)
         rootLayout.addView(titleLog)
         rootLayout.addView(loggerScrollView)
@@ -270,34 +297,117 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    private val statsRunnable = object : Runnable {
-        override fun run() {
-            try {
-                val tcpCount = com.tw.perapp4grouter.localvpn.TCB.getActiveTCBCount()
-                val tcpMax = com.tw.perapp4grouter.localvpn.TCB.getMaxTCBCount()
-                val udpCount = com.tw.perapp4grouter.localvpn.UDPOutput.getActiveUDPCount()
-                val udpMax = com.tw.perapp4grouter.localvpn.UDPOutput.getMaxUDPCount()
-                
-                val tcpRatio = if (tcpMax > 0) (tcpCount.toFloat() / tcpMax) * 100 else 0f
-                val udpRatio = if (udpMax > 0) (udpCount.toFloat() / udpMax) * 100 else 0f
-                
-                tvConnectionStats.text = String.format("TCP: %d/%d (%.1f%%) | UDP: %d/%d (%.1f%%)", tcpCount, tcpMax, tcpRatio, udpCount, udpMax, udpRatio)
-            } catch (e: Exception) {
-            }
-            tvConnectionStats.postDelayed(this, 1000)
+    private val snapshotListener = { snapshot: com.tw.perapp4grouter.stats.StatsSnapshot ->
+        runOnUiThread {
+            updateStatsUI(snapshot)
         }
+    }
+
+    private fun updateStatsUI(snapshot: com.tw.perapp4grouter.stats.StatsSnapshot) {
+        if (snapshot.isEmpty) {
+            tvConnectionStats.text = "無作用中連線"
+            activeConnectionsContainer.removeAllViews()
+            return
+        }
+
+        tvConnectionStats.text = "TCP: ${snapshot.totalTcp} | UDP: ${snapshot.totalUdp} | 總計: ${snapshot.totalFlows}"
+        
+        activeConnectionsContainer.removeAllViews()
+        
+        val sortedRows = snapshot.rows.sortedWith(
+            compareByDescending<com.tw.perapp4grouter.stats.AppStatsRow> { it.total }
+                .thenByDescending { it.lastActivityAtMillis }
+                .thenBy { it.label }
+        )
+
+        val labelCounts = snapshot.rows.groupingBy { it.label }.eachCount()
+
+        val displayCount = Math.min(5, sortedRows.size)
+        for (i in 0 until displayCount) {
+            val row = sortedRows[i]
+            val label = if (labelCounts[row.label] ?: 0 > 1 && row.packageNames.isNotEmpty()) {
+                "${row.label} (${row.packageNames.first()})"
+            } else {
+                row.label
+            }
+            val rowView = TextView(this).apply {
+                text = "$label: ${row.total} (TCP: ${row.activeTcp}, UDP: ${row.activeUdp})"
+                textSize = 14f
+                setPadding(0, 4, 0, 4)
+            }
+            activeConnectionsContainer.addView(rowView)
+        }
+
+        if (sortedRows.size > 5) {
+            val moreBtn = Button(this).apply {
+                text = "顯示全部 (${sortedRows.size} 個 APP)"
+                setOnClickListener {
+                    showAllConnectionsDialog(sortedRows, labelCounts)
+                }
+            }
+            activeConnectionsContainer.addView(moreBtn)
+        }
+    }
+
+    private fun showAllConnectionsDialog(sortedRows: List<com.tw.perapp4grouter.stats.AppStatsRow>, labelCounts: Map<String, Int>) {
+        val dialog = BottomSheetDialog(this)
+        
+        val layout = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(48, 48, 48, 48)
+        }
+        
+        val title = TextView(this).apply {
+            text = "所有作用中連線"
+            textSize = 20f
+            gravity = Gravity.CENTER
+            setPadding(0, 0, 0, 32)
+        }
+        layout.addView(title)
+        
+        val scrollView = ScrollView(this)
+        val container = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+        
+        for (row in sortedRows) {
+            val label = if (labelCounts[row.label] ?: 0 > 1 && row.packageNames.isNotEmpty()) {
+                "${row.label} (${row.packageNames.first()})"
+            } else {
+                row.label
+            }
+            val rowView = TextView(this).apply {
+                text = "$label: ${row.total} (TCP: ${row.activeTcp}, UDP: ${row.activeUdp})"
+                textSize = 14f
+                setPadding(0, 8, 0, 8)
+            }
+            container.addView(rowView)
+        }
+        
+        scrollView.addView(container)
+        layout.addView(scrollView, LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, 0, 1f))
+        
+        val btnClose = Button(this).apply {
+            text = "關閉"
+            setBackgroundColor(Color.TRANSPARENT)
+            setTextColor(Color.parseColor("#2196F3"))
+            setOnClickListener { dialog.dismiss() }
+        }
+        layout.addView(btnClose)
+        
+        dialog.setContentView(layout)
+        dialog.show()
     }
 
     override fun onResume() {
         super.onResume()
         AppLogger.addListener(logListener)
-        tvConnectionStats.post(statsRunnable)
+        com.tw.perapp4grouter.stats.StatsSnapshotRepository.addListener(snapshotListener)
+        updateStatsUI(com.tw.perapp4grouter.stats.StatsSnapshotRepository.latest())
     }
 
     override fun onPause() {
         super.onPause()
         AppLogger.removeListener(logListener)
-        tvConnectionStats.removeCallbacks(statsRunnable)
+        com.tw.perapp4grouter.stats.StatsSnapshotRepository.removeListener(snapshotListener)
     }
 
     private fun showSettingsDialog() {

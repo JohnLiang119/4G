@@ -150,6 +150,7 @@ public class TCPInput implements Runnable
                 if (tcb.status != TCBStatus.CLOSE_WAIT)
                 {
                     ByteBufferPool.release(receiveBuffer);
+                    TCB.closeTCB(tcb);
                     return;
                 }
 

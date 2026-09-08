@@ -175,3 +175,8 @@ foreach ($apk in $apkResults) {
     Write-Host "   APK: $pwd\$($apk.Name)" -ForegroundColor Green
 }
 Write-Host "========================================" -ForegroundColor Magenta
+
+# 明確以成功狀態結束：手機自動安裝屬盡力而為的附加步驟（adb devices／adb install
+# 皆為外部程式，會覆寫 $LASTEXITCODE），若不明確歸零，呼叫端（publish_all.ps1）
+# 會把安裝端的非致命失敗（如手機螢幕鎖定、USB 安裝被拒）誤判為打包本身失敗。
+exit 0
